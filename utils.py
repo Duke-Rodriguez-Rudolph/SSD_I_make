@@ -1,10 +1,11 @@
 # 工具
 import torch
+import math
+from functools import partial
 from math import sqrt
 
 def IOU(box1,box2):
     # box为[N,4],其中4为[xmin,ymin,xmax,ymax]
-
     # 得到的IOU矩阵为row:box1.N col:box2.N
     row = box1.size(0)
     col = box2.size(0)
@@ -64,6 +65,7 @@ def createPrior(input_size, feature_map_size, sk, ar):
     prior[:, 3] = prior[:, 1] + prior[:, 3]
 
     prior/=input_size[0]
+    prior=torch.clamp(prior,min=0, max=1)
     # prior为[anchor_num,4]或者说是[8732,4]
     return prior
 
@@ -85,27 +87,37 @@ def encode(classifi_out, location_out,prior,conf_thresh):
         classifi=classifi_out[i].view((-1,class_num+1))
         # tensor [8732,4]
         location=location_out[i].view((-1,4))
-
+        new_prior=prior.clone()
+        # xyxy2xywh
+        new_prior[:, 2] = new_prior[:, 2] - new_prior[:, 0]
+        new_prior[:, 3] = new_prior[:, 3] - new_prior[:, 1]
+        new_prior[:, 0] = new_prior[:, 0] + new_prior[:, 2] / 2
+        new_prior[:, 1] = new_prior[:, 1] + new_prior[:, 3] / 2
+        location[:, :2]*=0.1
+        location[:, 2:]*=0.2
         # x
-        location[:, 0] = prior[:, 0] + prior[:, 2] * location[:, 0]
+        location[:, 0] = (new_prior[:, 0] + new_prior[:, 2] * location[:, 0])
         # y
-        location[:, 1] = prior[:, 1] + prior[:, 3] * location[:, 1]
+        location[:, 1] = (new_prior[:, 1] + new_prior[:, 3] * location[:, 1])
         # w
-        location[:, 2] = torch.exp(location[:, 2]) * prior[:, 2]
+        location[:, 2] = torch.exp(location[:, 2]) * new_prior[:, 2]
         # h
-        location[:, 3] = torch.exp(location[:, 3]) * prior[:, 3]
+        location[:, 3] = torch.exp(location[:, 3]) * new_prior[:, 3]
         location*=300
+
         # 剔除背景
         back_mask=torch.max(classifi,dim=1)[1]>0
-        #print('classifi:',classifi)
+        
         location = location[back_mask, :]
         # 计算百分比 [N,class_num+1]
-        classifi=torch.softmax(classifi[back_mask,1:],dim=1)
+        classifi=torch.softmax(classifi[back_mask,:],dim=1)
         # 获取分类结果，classifi_result结果为[N]，为N个分类序号
+        if classifi.shape[0]==0:
+            continue
         classifi_score,classifi_result=torch.max(classifi,dim=1)
         # 剔除那些小于阈值的结果
         conf_mask=(classifi_score>=conf_thresh)
-        classifi_result=classifi_result[conf_mask]+1
+        classifi_result=classifi_result[conf_mask]
         location_result=location[conf_mask,:]
 
         # 剔除背景结果组合在一起，变为[N,2]
@@ -123,3 +135,39 @@ def encode(classifi_out, location_out,prior,conf_thresh):
 
     return location_list,classifi_list
 
+def get_lr_scheduler(lr_decay_type, lr, min_lr, total_iters, warmup_iters_ratio = 0.05, warmup_lr_ratio = 0.1, no_aug_iter_ratio = 0.05, step_num = 10):
+    def yolox_warm_cos_lr(lr, min_lr, total_iters, warmup_total_iters, warmup_lr_start, no_aug_iter, iters):
+        if iters <= warmup_total_iters:
+            # lr = (lr - warmup_lr_start) * iters / float(warmup_total_iters) + warmup_lr_start
+            lr = (lr - warmup_lr_start) * pow(iters / float(warmup_total_iters), 2) + warmup_lr_start
+        elif iters >= total_iters - no_aug_iter:
+            lr = min_lr
+        else:
+            lr = min_lr + 0.5 * (lr - min_lr) * (
+                1.0 + math.cos(math.pi* (iters - warmup_total_iters) / (total_iters - warmup_total_iters - no_aug_iter))
+            )
+        return lr
+
+    def step_lr(lr, decay_rate, step_size, iters):
+        if step_size < 1:
+            raise ValueError("step_size must above 1.")
+        n       = iters // step_size
+        out_lr  = lr * decay_rate ** n
+        return out_lr
+
+    if lr_decay_type == "cos":
+        warmup_total_iters  = min(max(warmup_iters_ratio * total_iters, 1), 3)
+        warmup_lr_start     = max(warmup_lr_ratio * lr, 1e-6)
+        no_aug_iter         = min(max(no_aug_iter_ratio * total_iters, 1), 15)
+        func = partial(yolox_warm_cos_lr ,lr, min_lr, total_iters, warmup_total_iters, warmup_lr_start, no_aug_iter)
+    else:
+        decay_rate  = (min_lr / lr) ** (1 / (step_num - 1))
+        step_size   = total_iters / step_num
+        func = partial(step_lr, lr, decay_rate, step_size)
+
+    return func
+   
+def set_optimizer_lr(optimizer, lr_scheduler_func, epoch):
+    lr = lr_scheduler_func(epoch)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr

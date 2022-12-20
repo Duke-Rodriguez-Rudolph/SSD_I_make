@@ -69,18 +69,18 @@ class SSD(nn.Module):
 
         self.VGG2=nn.Sequential(
             # 看原论文这里，是要保持特征图的尺寸与池化前一致，因此我们像下面这样设置
-            nn.MaxPool2d(kernel_size=3,stride=1,padding=1), # [batch,512,38,38]
-            nn.Conv2d(in_channels=512, out_channels=512, kernel_size=3, stride=1, padding=1),  # [batch,512,38,38]
+            nn.MaxPool2d(kernel_size=2, stride=2), # [batch,512,19,19]
+            nn.Conv2d(in_channels=512, out_channels=512, kernel_size=3, stride=1, padding=1),  # [batch,512,19,19]
             nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels=512, out_channels=512, kernel_size=3, stride=1, padding=1),  # [batch,512,38,38]
+            nn.Conv2d(in_channels=512, out_channels=512, kernel_size=3, stride=1, padding=1),  # [batch,512,19,19]
             nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels=512, out_channels=512, kernel_size=3, stride=1, padding=1),  # [batch,512,38,38]
+            nn.Conv2d(in_channels=512, out_channels=512, kernel_size=3, stride=1, padding=1),  # [batch,512,19,19]
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),  # [batch,512,19,19]
+            nn.MaxPool2d(kernel_size=3, stride=1, padding=1) # [batch,512,19,19]
         )
 
         self.Conv6=nn.Sequential(
-            nn.Conv2d(in_channels=512,out_channels=1024,kernel_size=3,stride=1,padding=1), # [batch,1024,19,19]
+            nn.Conv2d(in_channels=512,out_channels=1024,kernel_size=3, padding=6, dilation=6), # [batch,1024,19,19]
             nn.ReLU(inplace=True)
         )
 
@@ -115,7 +115,7 @@ class SSD(nn.Module):
         self.Conv10_2 = nn.Sequential(
             nn.Conv2d(in_channels=256, out_channels=128, kernel_size=1, stride=1),  # [batch,128,5,5]
             nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3, stride=2, padding=1),  # [batch,256,3,3]
+            nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3),  # [batch,256,3,3]
             nn.ReLU(inplace=True),
         )
 
@@ -132,8 +132,8 @@ class SSD(nn.Module):
         self.classifier6 = nn.Conv2d(in_channels=256, out_channels=4 * class_num, kernel_size=1) # [batch,4 * class_num,1,1]
         self.location6 = nn.Conv2d(in_channels=256, out_channels=4 * 4, kernel_size=1) # [batch,4*4,1,1]
 
-        if init_weights:
-            self._initialize()
+        #if init_weights:
+            #self._initialize()
 
     def forward(self,x):
         x=self.VGG1(x)
@@ -180,17 +180,17 @@ class SSD(nn.Module):
     def _initialize(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                #nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                #torch.nn.init.kaiming_normal_(m.weight.data, a=0, mode='fan_in')
                 nn.init.normal_(m.weight.data, 0.0, 0.02)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+                #nn.init.xavier_normal_(m.weight.data, gain=0.02)
+                #if m.bias is not None:
+                    #nn.init.constant_(m.bias, 0)
 
     def loadVGG(self,VGG_path):
         our_checkpoint = self.state_dict()
         vgg_checkpoint = torch.load(VGG_path)
         model_name = []
         checkpoint_name = []
-
         for name, value in our_checkpoint.items():
             name_list = name.split('.')
             if name_list[0] == 'VGG1' or name_list[0] == 'VGG2':
@@ -200,9 +200,9 @@ class SSD(nn.Module):
             name_list = name.split('.')
             if name_list[0] == 'features':
                 checkpoint_name.append(name)
+
         for i in range(len(model_name)):
             our_checkpoint[model_name[i]] = vgg_checkpoint[checkpoint_name[i]]
-
         self.load_state_dict(our_checkpoint)
 
 # 损失函数
@@ -224,38 +224,33 @@ class LossFunction(nn.Module):
         mask=classifi_label>0
         # 计算每个batch的正样本个数,true为1，false为0，维度为[batch_size]
         pos_num=mask.sum(dim=1)
-        #print('pos_num:',pos_num)
         # 定位损失，将四个值的损失加在一起，由[batch_size,8732，4]->[batch_size,8732]
-        loc_loss=self.location_loss(location_output,location_label).sum(dim=-1)
+        loc_loss=self.location_loss(location_label,location_output).sum(dim=-1)
         # 只将正样本的定位损失加起来，随后将8732个定位损失加起来，得到每个batch一个的损失
         loc_loss=(loc_loss*mask.float()).sum(dim=-1)
-        #print('loc_loss:',loc_loss)
-        
 
         # 置信度的损失，classifi_label为[batch_size,8732],classifi_output为[batch_size,8732，1+class_num]
         # con为[batch_size,8732],这里是把背景当成一个分类进行计算
         con=self.classifi_loss(classifi_output.transpose(1,2),classifi_label.long())
 
-        # 获取负样本
-        con_neg=con.clone()
-        # 将所有正样本剔除
-        con_neg[mask]=0
+        max_conf=classifi_output[:,:,1:].sum(dim=2)
+        max_conf[mask]=-100
+
         # 选出loss大的负样本，首先是按照loss进行排序,con_rank中每个值都是这个loss在所有loss中的排序
-        con_rank=con_neg.sort(dim=1,descending=True)[1].sort(dim=1)[1]
+        con_rank=max_conf.sort(dim=1,descending=True)[1].sort(dim=1)[1]
         # 负样本的个数,使负样本数量为正样本数量的3倍，但最高不能超过8732减去正样本数，最后再加一个维度，变成[batch_size,1]
         neg_num=torch.clamp(3 * pos_num, max=mask.size(1)).unsqueeze(-1)
-        neg_num[neg_num==0]=3
+        neg_num[neg_num==0]=100
         # 维度为[batch_size, 8732]
         neg_mask=con_rank<neg_num
-        #print('pos_con:',con[mask])
-        #print('neg_con:',con[neg_mask])
         # con_loss为[batch_size]，sum前是[batch_size,8732]
         con_loss=(con*(mask.float()+neg_mask.float())).sum(dim=1)
         # 损失相加
         alpha=1.0
-        total_loss=loc_loss+alpha*con_loss
+        #total_loss=loc_loss+alpha*con_loss
         pos_num     = torch.where(pos_num != 0, pos_num, torch.ones_like(pos_num))
-        total_loss=(total_loss/pos_num).mean(dim=0)
+        total_loss  = (con*mask.float()).sum() + (con*neg_mask.float()).sum() + (alpha * loc_loss).sum()
+        total_loss=total_loss/(pos_num.sum())
         #print('total_loss:',total_loss)
         return total_loss
 
